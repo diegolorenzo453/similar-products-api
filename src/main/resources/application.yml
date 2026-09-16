@@ -1,0 +1,13 @@
+server:
+  port: 5000
+  shutdown: graceful
+
+spring:
+  application:
+    name: similar-products
+
+clients:
+  product-api:
+    base-url: ${PRODUCT_API_BASE_URL:http://localhost:3001}
+    timeout: ${PRODUCT_API_TIMEOUT:2s}
+    max-concurrency: ${PRODUCT_API_MAX_CONCURRENCY:10}
