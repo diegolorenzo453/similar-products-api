@@ -143,12 +143,28 @@ Returning partial results is an explicit product-level assumption because the su
 
 ## Package as a container
 
+Build the executable JAR and the image:
+
 ```bash
 mvn clean package
 docker build -t similar-products .
+```
+
+With Docker Desktop, where `host.docker.internal` resolves the host automatically:
+
+```bash
 docker run --rm -p 5000:5000 \
   -e PRODUCT_API_BASE_URL=http://host.docker.internal:3001 \
   similar-products
 ```
 
-When the mock also runs as a container, ensure the application can reach it through the hostname appropriate to the local Docker environment. The default local-development configuration expects the mock at `http://localhost:3001`.
+With Docker Engine installed directly in Linux/WSL, attach the application to the Compose network and address the mock by its service name. Replace `backenddevtest_default` if `docker network ls` shows a different Compose network name:
+
+```bash
+docker compose up -d simulado
+docker run --rm --network backenddevtest_default -p 5000:5000 \
+  -e PRODUCT_API_BASE_URL=http://simulado:80 \
+  similar-products
+```
+
+The image uses a Java 17 JRE and exposes port 5000. The default non-containerized development configuration expects the mock at `http://localhost:3001`.
