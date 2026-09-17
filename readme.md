@@ -1,6 +1,6 @@
 # Similar Products API
 
-Spring Boot application that exposes the product details of the products most similar to a given product. It implements the contract in [`similarProducts.yaml`](./similarProducts.yaml) and consumes the mock APIs described in [`existingApis.yaml`](./existingApis.yaml).
+Spring Boot application that exposes the product details of the products most similar to a given product. [`similarProducts.yaml`](./similarProducts.yaml) is the source of truth: the Maven build generates the WebFlux controller interface and response model, and the handwritten controller implements that interface. The application consumes the mock APIs described in [`existingApis.yaml`](./existingApis.yaml).
 
 ## API
 
@@ -26,9 +26,19 @@ The response retains the order supplied by the similar-IDs API and contains no d
 
 ## Requirements
 
-- Java 17+
-- Maven 3.9+
-- Docker only for running the supplied mocks and performance test
+- Docker Compose (recommended), or Java 17+ for local development
+
+Maven does not need to be installed: the repository includes Maven Wrapper.
+
+## Run the complete stack with Docker Compose
+
+Build and start the application and supplied mock in one command:
+
+```bash
+docker compose up --build app simulado
+```
+
+The API is available at <http://localhost:5000/product/1/similar>. The image is built in two stages, runs on Java 17 as an unprivileged user, and does not require a prebuilt JAR.
 
 ## Run locally
 
@@ -41,8 +51,10 @@ docker compose up -d simulado
 Then start the application (it listens on port **5000**):
 
 ```bash
-mvn spring-boot:run
+./mvnw spring-boot:run
 ```
+
+On Windows PowerShell use `./mvnw.cmd spring-boot:run`.
 
 The upstream URL and resilience settings can be overridden without rebuilding:
 
@@ -51,14 +63,18 @@ The upstream URL and resilience settings can be overridden without rebuilding:
 | `PRODUCT_API_BASE_URL` | `http://localhost:3001` | Existing product API URL |
 | `PRODUCT_API_TIMEOUT` | `2s` | Timeout for each upstream request |
 | `PRODUCT_API_MAX_CONCURRENCY` | `10` | Maximum concurrent detail requests per call |
+| `PRODUCT_API_MAX_CONCURRENT_CALLS` | `100` | Global maximum detail calls across all requests |
+| `PRODUCT_API_OPERATION_TIMEOUT` | `3s` | End-to-end budget for the complete operation |
 
 ## Automated tests
 
 The tests are self-contained and use a mocked HTTP transport; Docker and open network ports are not required:
 
 ```bash
-mvn clean verify
+./mvnw clean verify
 ```
+
+On Windows use `./mvnw.cmd clean verify`. JaCoCo creates an HTML report at `target/site/jacoco/index.html` and fails the build if line coverage falls below **70%**. GitHub Actions runs this same command on every push and pull request.
 
 The automated suite covers:
 
@@ -70,13 +86,15 @@ The automated suite covers:
 - Missing individual product details.
 - Upstream server errors and timeouts.
 - Partial responses when one recommendation is unavailable.
+- End-to-end operation budget expiration.
+- Rejection when the global bulkhead is full.
 
 ## Supplied performance test
 
-With this application running on port 5000:
+Start the full stack and execute the supplied k6 test inside its Compose network:
 
 ```bash
-docker compose up -d simulado influxdb grafana
+docker compose up -d --build app simulado influxdb grafana
 docker compose run --rm k6 run scripts/test.js
 ```
 
@@ -106,15 +124,17 @@ HTTP request
 
 For each request, the service first obtains the ordered similar-product IDs. It removes duplicates while preserving their first occurrence, then fetches the corresponding details concurrently. `flatMapSequential` allows those HTTP calls to run in parallel but emits their results in the original similarity order.
 
-The domain response uses `BigDecimal` for prices so decimal values are represented without binary floating-point artifacts.
+The generated response model uses `BigDecimal` for prices so decimal values are represented without binary floating-point artifacts.
 
 ## Design decisions
 
 - **Non-blocking I/O:** Spring WebFlux avoids tying up one platform thread per upstream request under the supplied concurrent load.
 - **Parallel fan-out with stable ordering:** product details are fetched concurrently, while `flatMapSequential` preserves the similarity order from the IDs endpoint. Concurrency is bounded to protect the dependency.
+- **Contract-first API:** OpenAPI Generator creates `ProductsApi` and `ProductDetail` during `generate-sources`. A contract change therefore produces a compile-time change instead of silently drifting from the implementation. The contract documents 200, 404 and 502 responses.
 - **Partial-result resilience:** an unavailable, failed, or timed-out similar-product detail is omitted instead of failing the whole response. If the initial IDs lookup returns 404, the API returns 404; other failures of that essential lookup return 502.
-- **Bounded latency:** every upstream operation has a configurable timeout. Duplicate IDs are removed while retaining their first occurrence, satisfying the response contract's uniqueness constraint.
-- **Separation of responsibilities:** the web adapter, application orchestration, domain model, and external API adapter live in separate packages.
+- **Bounded latency:** every upstream call has a timeout and the complete aggregation has a separate deadline. When the detail phase reaches that deadline, already completed products are returned and outstanding work is cancelled.
+- **Global load protection:** the per-request fan-out limit is complemented by a singleton Resilience4j semaphore bulkhead. Consequently, simultaneous incoming requests share one fixed downstream concurrency budget rather than each receiving the full allowance.
+- **Separation of responsibilities:** generated API contract, web adapter, application orchestration, observability and external API adapter live in separate packages.
 
 ### Error semantics
 
@@ -131,8 +151,19 @@ Returning partial results is an explicit product-level assumption because the su
 
 - Detail calls are independent, so executing them concurrently reduces response time from the sum of all latencies to approximately the slowest accepted call.
 - Concurrency is bounded instead of unlimited, preventing one request with many IDs from overwhelming the upstream service.
-- Requests are not retried automatically. Retrying a degraded dependency under load could amplify the incident; retries would require an agreed policy, backoff and jitter.
-- A circuit breaker and metrics could be added for production operation, but were intentionally not introduced into this small exercise without concrete availability objectives.
+- The semaphore bulkhead rejects excess detail calls immediately and they follow the documented partial-response policy. This prevents queue growth and protects both this service and its dependency.
+- A circuit breaker was considered but not enabled blindly: the mock does not provide failure-rate or recovery objectives from which to choose thresholds. In production, one would be added around the shared client once those SLOs exist, with failure-rate/slow-call thresholds, a short open interval and half-open probes. The bulkhead remains necessary because a circuit breaker controls failure propagation, not concurrent resource consumption.
+- Automatic retries are deliberately absent. Retrying a degraded dependency under load can amplify an incident; any future retry policy should be limited to safe transient failures and use backoff and jitter.
+
+## Observability
+
+Spring Boot Actuator exposes:
+
+- `GET /actuator/health`, `/actuator/health/liveness` and `/actuator/health/readiness`.
+- `GET /actuator/prometheus` for Prometheus-compatible metrics.
+- `GET /actuator/metrics` to inspect available meter names.
+
+Custom metrics include `similar_products_operation_duration_seconds`, `similar_products_responses_total{result="partial|complete"}` and `similar_products_downstream_errors_total`. The partial-response percentage is `partial / (partial + complete)`. Logs include the source product ID, requested/returned counts, partial status, failed detail ID and normalized failure reason; they avoid logging response bodies.
 
 ## Assumptions
 
@@ -143,10 +174,9 @@ Returning partial results is an explicit product-level assumption because the su
 
 ## Package as a container
 
-Build the executable JAR and the image:
+The recommended container command is the complete Compose workflow above. To build an individual image instead:
 
 ```bash
-mvn clean package
 docker build -t similar-products .
 ```
 
@@ -158,13 +188,4 @@ docker run --rm -p 5000:5000 \
   similar-products
 ```
 
-With Docker Engine installed directly in Linux/WSL, attach the application to the Compose network and address the mock by its service name. Replace `backenddevtest_default` if `docker network ls` shows a different Compose network name:
-
-```bash
-docker compose up -d simulado
-docker run --rm --network backenddevtest_default -p 5000:5000 \
-  -e PRODUCT_API_BASE_URL=http://simulado:80 \
-  similar-products
-```
-
-The image uses a Java 17 JRE and exposes port 5000. The default non-containerized development configuration expects the mock at `http://localhost:3001`.
+For Docker Engine inside Linux/WSL, `docker compose up --build app simulado` works unchanged because services communicate by Compose DNS. The default non-containerized development configuration expects the mock at `http://localhost:3001`.

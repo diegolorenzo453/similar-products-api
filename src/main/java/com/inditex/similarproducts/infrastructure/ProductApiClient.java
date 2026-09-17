@@ -1,9 +1,13 @@
 package com.inditex.similarproducts.infrastructure;
 
 import com.inditex.similarproducts.config.ProductApiProperties;
-import com.inditex.similarproducts.domain.ProductDetail;
+import com.inditex.similarproducts.generated.model.ProductDetail;
+import com.inditex.similarproducts.observability.SimilarProductsMetrics;
 import com.inditex.similarproducts.web.ProductNotFoundException;
 import com.inditex.similarproducts.web.UpstreamServiceException;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadFullException;
+import io.github.resilience4j.reactor.bulkhead.operator.BulkheadOperator;
 import java.util.List;
 import java.util.concurrent.TimeoutException;
 import org.slf4j.Logger;
@@ -22,10 +26,15 @@ public class ProductApiClient {
 
     private final WebClient webClient;
     private final ProductApiProperties properties;
+    private final Bulkhead productDetailsBulkhead;
+    private final SimilarProductsMetrics metrics;
 
-    public ProductApiClient(WebClient productWebClient, ProductApiProperties properties) {
+    public ProductApiClient(WebClient productWebClient, ProductApiProperties properties,
+            Bulkhead productDetailsBulkhead, SimilarProductsMetrics metrics) {
         this.webClient = productWebClient;
         this.properties = properties;
+        this.productDetailsBulkhead = productDetailsBulkhead;
+        this.metrics = metrics;
     }
 
     public Mono<List<String>> findSimilarIds(String productId) {
@@ -42,6 +51,7 @@ public class ProductApiClient {
                             "Product service returned " + response.statusCode().value())));
                 })
                 .timeout(properties.timeout())
+                .doOnError(error -> metrics.recordDownstreamError("similar-ids", reason(error)))
                 .onErrorMap(TimeoutException.class,
                         error -> new UpstreamServiceException("Product service timed out", error));
     }
@@ -53,9 +63,26 @@ public class ProductApiClient {
                         ? response.bodyToMono(ProductDetail.class)
                         : response.releaseBody().then(Mono.empty()))
                 .timeout(properties.timeout())
+                .transformDeferred(BulkheadOperator.of(productDetailsBulkhead))
                 .onErrorResume(error -> {
-                    log.warn("Skipping unavailable similar product {}: {}", productId, error.getMessage());
+                    String reason = reason(error);
+                    metrics.recordDownstreamError("product-detail", reason);
+                    log.warn("Skipping similar product; productId={}, reason={}, message={}",
+                            productId, reason, error.getMessage());
                     return Mono.empty();
                 });
+    }
+
+    private static String reason(Throwable error) {
+        if (error instanceof TimeoutException) {
+            return "timeout";
+        }
+        if (error instanceof BulkheadFullException) {
+            return "bulkhead-full";
+        }
+        if (error instanceof ProductNotFoundException) {
+            return "not-found";
+        }
+        return "upstream-error";
     }
 }

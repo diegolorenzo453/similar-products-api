@@ -3,8 +3,12 @@ package com.inditex.similarproducts;
 import com.inditex.similarproducts.application.SimilarProductsService;
 import com.inditex.similarproducts.config.ProductApiProperties;
 import com.inditex.similarproducts.infrastructure.ProductApiClient;
+import com.inditex.similarproducts.observability.SimilarProductsMetrics;
 import com.inditex.similarproducts.web.ApiExceptionHandler;
 import com.inditex.similarproducts.web.SimilarProductsController;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
+import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 import java.time.Duration;
 import java.util.Map;
 import org.junit.jupiter.api.BeforeEach;
@@ -24,8 +28,11 @@ class SimilarProductsApiTest {
 
     @BeforeEach
     void setUp() {
-        ProductApiProperties properties = new ProductApiProperties(
-                "http://product-api", Duration.ofSeconds(1), 10);
+        configureApi(new ProductApiProperties(
+                "http://product-api", Duration.ofSeconds(1), Duration.ofSeconds(2), 10, 10));
+    }
+
+    private void configureApi(ProductApiProperties properties) {
         ExchangeFunction exchange = request -> {
             StubResponse stub = responses.get(request.url().getPath());
             if (stub == null) {
@@ -34,8 +41,13 @@ class SimilarProductsApiTest {
             return Mono.delay(stub.delay()).thenReturn(response(stub.status(), stub.body()));
         };
         WebClient webClient = WebClient.builder().exchangeFunction(exchange).build();
-        ProductApiClient client = new ProductApiClient(webClient, properties);
-        SimilarProductsService service = new SimilarProductsService(client, properties);
+        SimilarProductsMetrics metrics = new SimilarProductsMetrics(new SimpleMeterRegistry());
+        Bulkhead bulkhead = Bulkhead.of("test-product-details", BulkheadConfig.custom()
+                .maxConcurrentCalls(properties.maxConcurrentCalls())
+                .maxWaitDuration(Duration.ZERO)
+                .build());
+        ProductApiClient client = new ProductApiClient(webClient, properties, bulkhead, metrics);
+        SimilarProductsService service = new SimilarProductsService(client, properties, metrics);
 
         api = WebTestClient.bindToController(new SimilarProductsController(service))
                 .controllerAdvice(new ApiExceptionHandler())
@@ -129,6 +141,39 @@ class SimilarProductsApiTest {
                 .jsonPath("$.length()").isEqualTo(2)
                 .jsonPath("$[0].id").isEqualTo("2")
                 .jsonPath("$[1].id").isEqualTo("3");
+    }
+
+    @Test
+    void returnsAvailableResultsWhenTheWholeOperationBudgetExpires() {
+        configureApi(new ProductApiProperties(
+                "http://product-api", Duration.ofSeconds(2), Duration.ofMillis(250), 2, 10));
+        stub("/product/1/similarids", HttpStatus.OK, "[\"2\",\"slow\"]");
+        stub("/product/2", HttpStatus.OK,
+                "{\"id\":\"2\",\"name\":\"Dress\",\"price\":19.99,\"availability\":true}");
+        stub("/product/slow", HttpStatus.OK,
+                "{\"id\":\"slow\",\"name\":\"Slow\",\"price\":1,\"availability\":true}", 600);
+
+        api.get().uri("/product/1/similar").exchange()
+                .expectStatus().isOk()
+                .expectBody()
+                .jsonPath("$.length()").isEqualTo(1)
+                .jsonPath("$[0].id").isEqualTo("2");
+    }
+
+    @Test
+    void globalBulkheadLimitsConcurrentDetailCalls() {
+        configureApi(new ProductApiProperties(
+                "http://product-api", Duration.ofSeconds(1), Duration.ofSeconds(2), 2, 1));
+        stub("/product/1/similarids", HttpStatus.OK, "[\"2\",\"3\"]");
+        stub("/product/2", HttpStatus.OK,
+                "{\"id\":\"2\",\"name\":\"Dress\",\"price\":19.99,\"availability\":true}", 100);
+        stub("/product/3", HttpStatus.OK,
+                "{\"id\":\"3\",\"name\":\"Blazer\",\"price\":29.99,\"availability\":true}", 100);
+
+        api.get().uri("/product/1/similar").exchange()
+                .expectStatus().isOk()
+                .expectBody()
+                .jsonPath("$.length()").isEqualTo(1);
     }
 
     private void stub(String path, HttpStatus status, String body) {

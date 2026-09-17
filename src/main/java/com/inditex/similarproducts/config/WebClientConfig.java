@@ -1,6 +1,8 @@
 package com.inditex.similarproducts.config;
 
 import java.time.Duration;
+import io.github.resilience4j.bulkhead.Bulkhead;
+import io.github.resilience4j.bulkhead.BulkheadConfig;
 import io.netty.channel.ChannelOption;
 import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.context.annotation.Bean;
@@ -24,5 +26,13 @@ public class WebClientConfig {
                 .baseUrl(properties.baseUrl())
                 .clientConnector(new ReactorClientHttpConnector(httpClient))
                 .build();
+    }
+
+    @Bean
+    Bulkhead productDetailsBulkhead(ProductApiProperties properties) {
+        return Bulkhead.of("product-details", BulkheadConfig.custom()
+                .maxConcurrentCalls(properties.maxConcurrentCalls())
+                .maxWaitDuration(Duration.ZERO)
+                .build());
     }
 }

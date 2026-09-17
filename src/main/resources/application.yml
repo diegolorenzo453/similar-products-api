@@ -10,4 +10,20 @@ clients:
   product-api:
     base-url: ${PRODUCT_API_BASE_URL:http://localhost:3001}
     timeout: ${PRODUCT_API_TIMEOUT:2s}
+    operation-timeout: ${PRODUCT_API_OPERATION_TIMEOUT:3s}
     max-concurrency: ${PRODUCT_API_MAX_CONCURRENCY:10}
+    max-concurrent-calls: ${PRODUCT_API_MAX_CONCURRENT_CALLS:100}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: when_authorized
+      probes:
+        enabled: true
+  metrics:
+    tags:
+      application: ${spring.application.name}

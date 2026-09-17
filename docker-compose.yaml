@@ -1,5 +1,12 @@
-version: "3.3"
 services:
+  app:
+    build: .
+    ports:
+      - "5000:5000"
+    environment:
+      PRODUCT_API_BASE_URL: http://simulado:80
+    depends_on:
+      - simulado
   influxdb:
     image: influxdb:1.8.2
     ports:
@@ -31,5 +38,7 @@ services:
       - ./shared/k6:/scripts
     environment:
       - K6_OUT=influxdb=http://influxdb:8086/k6
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - BASE_URL=http://app:5000
+    depends_on:
+      - app
+      - influxdb

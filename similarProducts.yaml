@@ -13,7 +13,9 @@ paths:
         in: path
         required: true
     get:
-      operationId: get-product-similar
+      tags:
+        - Products
+      operationId: getProductSimilar
       summary: Similar products
       responses:
         '200':
@@ -24,6 +26,8 @@ paths:
                  $ref: '#/components/schemas/SimilarProducts'
         '404':
           description: Product Not found
+        '502':
+          description: Upstream product service unavailable
 components:
   schemas:
     SimilarProducts:
